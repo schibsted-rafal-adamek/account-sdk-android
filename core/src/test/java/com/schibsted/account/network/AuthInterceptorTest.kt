@@ -18,6 +18,7 @@ import com.schibsted.account.network.AuthInterceptor.Companion.replaceAuthHeader
 import com.schibsted.account.session.User
 import com.schibsted.account.test.TestUtil
 import io.kotlintest.forAll
+import io.kotlintest.matchers.beInstanceOf
 import io.kotlintest.matchers.should
 import io.kotlintest.matchers.shouldBe
 import io.kotlintest.matchers.shouldThrow
@@ -304,18 +305,16 @@ class AuthInterceptorTest : WordSpec() {
         }
 
         "whitelistCheck" should {
-            val icpt = AuthInterceptor(defaultMockUser, listOf("https://example.com"))
-
             "not throw an exception if url is whitelisted" {
                 val req = Request.Builder().url("https://example.com").build()
-                icpt.whitelistCheck(req, 0)
+                val check = checkUrlInWhitelist(listOf("https://example.com"), false)
+                check.validate(req) shouldBe AuthCheck.AuthCheckResult.Passed
             }
 
             "throw an AuthException if url is not whitelisted" {
                 val req = Request.Builder().url("https://another-example.com").build()
-                shouldThrow<AuthException> {
-                    icpt.whitelistCheck(req, 0)
-                }
+                val check = checkUrlInWhitelist(listOf("https://example.com"), false)
+                check.validate(req) should beInstanceOf(AuthCheck.AuthCheckResult.Failed::class)
             }
         }
 
@@ -324,14 +323,12 @@ class AuthInterceptorTest : WordSpec() {
 
             "not throw an exception if url is using the HTTPS protocol" {
                 val req = Request.Builder().url("https://example.com").build()
-                icpt.protocolCheck(req, 0)
+                protocolCheck(false).validate(req) shouldBe AuthCheck.AuthCheckResult.Passed
             }
 
             "throw an AuthException if url is not whitelisted" {
                 val req = Request.Builder().url("http://example.com").build()
-                shouldThrow<AuthException> {
-                    icpt.protocolCheck(req, 0)
-                }
+                protocolCheck(false).validate(req) should beInstanceOf(AuthCheck.AuthCheckResult.Failed::class)
             }
         }
     }

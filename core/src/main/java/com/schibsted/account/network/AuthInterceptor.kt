@@ -18,6 +18,24 @@ import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
+fun checkUrlInWhitelist(whitelist: List<String>, allowNonWhitelistedDomains: Boolean = false) = AuthCheck { req ->
+    if (allowNonWhitelistedDomains) {
+        AuthCheck.AuthCheckResult.Passed
+    } else {
+        val url = req.url().toString()
+        whitelist.find { url.startsWith(it) }?.let { AuthCheck.AuthCheckResult.Passed }
+                ?: AuthCheck.AuthCheckResult.Failed("Requests can only be done to whitelisted urls, unless this check is specifically disabled")
+    }
+}
+
+fun protocolCheck(allowNonHttps: Boolean = false) = AuthCheck { req ->
+    if (!allowNonHttps && !req.url().isHttps) {
+        AuthCheck.AuthCheckResult.Failed("Authenticated requests can only be done over HTTPS unless specifically allowed")
+    } else {
+        AuthCheck.AuthCheckResult.Passed
+    }
+}
+
 /**
  * Creates an interceptor which will do authenticated requests to whitelisted urls. By default, requests to non-whitelisted
  * domains will be rejected as well as non-https requests. This can be overridden using [allowNonWhitelistedDomains] and
@@ -34,7 +52,11 @@ class AuthInterceptor internal constructor(
     private val urlWhitelist: List<String>,
     private val allowNonHttps: Boolean = false,
     private val allowNonWhitelistedDomains: Boolean = false,
-    private val timeout: Long = 10_000
+    private val timeout: Long = 10_000,
+    private val authChecks: Sequence<AuthCheck> = sequenceOf(
+            checkUrlInWhitelist(urlWhitelist, allowNonWhitelistedDomains),
+            protocolCheck(allowNonHttps)
+    )
 ) : Interceptor {
 
     private val lock = ConditionVariable()
@@ -54,25 +76,6 @@ class AuthInterceptor internal constructor(
 
     private fun urlInWhitelist(url: HttpUrl): Boolean = urlWhitelist.find { url.toString().startsWith(it) } != null
 
-    private fun logAndThrow(message: String) {
-        Logger.error(TAG, message)
-        throw AuthException(message)
-    }
-
-    @VisibleForTesting(otherwise = VisibleForTesting.PACKAGE_PRIVATE)
-    internal fun protocolCheck(req: Request, reqId: Int) {
-        if (!req.url().isHttps && !this.allowNonHttps) {
-            logAndThrow("Authenticated request (ReqId:$reqId) failed: Request protocol is not HTTPS")
-        }
-    }
-
-    @VisibleForTesting(otherwise = VisibleForTesting.PACKAGE_PRIVATE)
-    internal fun whitelistCheck(req: Request, reqId: Int) {
-        if (!urlInWhitelist(req.url()) && !this.allowNonWhitelistedDomains) {
-            logAndThrow("Authenticated request (ReqId:$reqId) failed: Authenticated requests can only be done to the specified urls, unless specifically enabled: ${urlWhitelist.joinToString { ", " }}")
-        }
-    }
-
     @Throws(AuthException::class, IOException::class)
     override fun intercept(chain: Interceptor.Chain): Response {
         val originalRequest = chain.request()
@@ -80,28 +83,17 @@ class AuthInterceptor internal constructor(
         val reqId = requestNo.getAndIncrement()
 
         Logger.verbose(TAG, { "Attempting to perform authenticated request (ReqId:$reqId) to ${originalUrl.toString().safeUrl()}" })
-
-        protocolCheck(originalRequest, reqId)
-        whitelistCheck(originalRequest, reqId)
-
-        Logger.verbose(TAG, { "Security checks passed for request (ReqId:$reqId) to ${originalUrl.toString().safeUrl()}" })
-
-        val token = user.token
-        if (token == null) {
-            Logger.error(TAG, { "Unable to perform authenticated request (ReqId:$reqId) to ${originalUrl.toString().safeUrl()}. Reason: User logged out" })
-            throw AuthException("Unable to perform authenticated request (ReqId:$reqId) to ${originalUrl.toString().safeUrl()}. Reason: User logged out")
-        }
-
-        val request = with(originalRequest.newBuilder()) {
-            if (urlInWhitelist(originalUrl)) {
-                addAuthHeaderIfNeeded(originalRequest, token)
-            } else {
-                removeHeader("Authorization")
-                Logger.info(TAG, { "URL is not whitelisted, not attaching Authorization header for request (ReqId:$reqId)" })
+        authChecks.forEach {
+            val result = it.validate(originalRequest)
+            if (result is AuthCheck.AuthCheckResult.Failed) {
+                Logger.error(TAG, { "Cannot perform authenticated request: ${result.reason}" })
+                throw AuthException("Cannot perform authenticated request: ${result.reason}")
             }
-            build()
         }
+        Logger.verbose(TAG, { "Security checks passed for request (ReqId:$reqId)" })
 
+        val token = user.token ?: throw AuthException("Cannot perform authenticated request (ReqId:$reqId) when the user is logged out")
+        val request = originalRequest.newBuilder().addAuthHeaderIfNeeded(originalRequest, token).build()
         val response = chain.proceed(request)
 
         return if (response.code() == 401) {
